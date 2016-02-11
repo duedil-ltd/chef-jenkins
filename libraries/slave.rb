@@ -79,7 +79,8 @@ class Chef
     attribute :jvm_options,
       kind_of: String
     attribute :nofile_limit,
-      kind_of: Integer
+      kind_of: Integer,
+      default: 4096
 
     attr_writer :exists
     attr_writer :connected
