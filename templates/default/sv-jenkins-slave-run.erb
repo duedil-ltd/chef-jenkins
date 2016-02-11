@@ -8,7 +8,7 @@
 exec 2>&1
 cd <%= @options[:new_resource].remote_fs %>
 exec chpst -u <%= @options[:new_resource].user %> \
-  -o <%= node[:new_resource].nofile_limit %> \
+  -o <%= @options[:new_resource].nofile_limit %> \
   env HOME=<%= @options[:new_resource].remote_fs %> \
   JENKINS_HOME=<%= @options[:new_resource].remote_fs %> \
   <%= @options[:java_bin] %> \
