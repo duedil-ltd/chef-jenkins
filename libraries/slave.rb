@@ -78,6 +78,9 @@ class Chef
       default: 'jenkins'
     attribute :jvm_options,
       kind_of: String
+    attribute :nofile_limit,
+      kind_of: Integer,
+      default: 4096
 
     attr_writer :exists
     attr_writer :connected
