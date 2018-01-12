@@ -1,10 +1,11 @@
 #
-# Cookbook Name:: jenkins
+# Cookbook:: jenkins
 # HWRP:: plugin
 #
 # Author:: Seth Vargo <sethvargo@gmail.com>
+# Author:: Seth Chisamore <schisamo@chef.io>
 #
-# Copyright 2013-2014, Chef Software, Inc.
+# Copyright:: 2013-2017, Chef Software, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,17 +20,16 @@
 # limitations under the License.
 #
 
+require 'digest'
+
 require_relative '_helper'
-require_relative '_params_validate'
 
 class Chef
   class Resource::JenkinsPlugin < Resource::LWRPBase
+    resource_name :jenkins_plugin
+
     # Chef attributes
     identity_attr :name
-    provides :jenkins_plugin
-
-    # Set the resource name
-    self.resource_name = :jenkins_plugin
 
     # Actions
     actions :install, :uninstall, :enable, :disable
@@ -37,15 +37,18 @@ class Chef
 
     # Attributes
     attribute :name,
-      kind_of: String,
-      name_attribute: true
+              kind_of: String,
+              name_attribute: true
     attribute :version,
-      kind_of: [String, Symbol],
-      default: :latest
+              kind_of: [String, Symbol],
+              default: :latest
     attribute :source,
-      kind_of: String
+              kind_of: String
+    attribute :install_deps,
+              kind_of: [TrueClass, FalseClass],
+              default: true
     attribute :options,
-      kind_of: String
+              kind_of: String
 
     attr_writer :installed
 
@@ -56,13 +59,19 @@ class Chef
     # @return [Boolean]
     #
     def installed?
-      !!@installed
+      !@installed.nil? && @installed
     end
   end
 end
 
 class Chef
   class Provider::JenkinsPlugin < Provider::LWRPBase
+    provides :jenkins_plugin
+    use_inline_resources
+    include Jenkins::Helper
+
+    provides :jenkins_plugin
+
     class PluginNotInstalled < StandardError
       def initialize(plugin, action)
         super <<-EOH
@@ -72,16 +81,16 @@ EOH
       end
     end
 
-    include Jenkins::Helper
-
     def load_current_resource
       @current_resource ||= Resource::JenkinsPlugin.new(new_resource.name)
       @current_resource.source(new_resource.source)
       @current_resource.version(new_resource.version)
 
+      current_plugin = plugin_installation_manifest(new_resource.name)
+
       if current_plugin
         @current_resource.installed = true
-        @current_resource.version(current_plugin[:plugin_version])
+        @current_resource.version(current_plugin['plugin_version'])
       else
         @current_resource.installed = false
       end
@@ -96,45 +105,54 @@ EOH
       true
     end
 
-    action(:install) do
+    action :install do
       # This block stores the actual command to execute, since its the same
       # for upgrades and installs.
-      block = proc do
+      install_block = proc do
         # Install a plugin from a given hpi (or jpi) if a link was provided.
         # In that case jenkins does not handle plugin dependencies automatically.
         # Otherwise the plugin is installed through the jenkins update-center
         # (default behaviour). In that case plugin dependencies are handled by jenkins.
         if new_resource.source
-          # Use the remote_file resource to download and cache the plugin (see
-          # comment below for more information).
-          name   = "#{new_resource.name}-#{new_resource.version}.plugin"
-          path   = ::File.join(Chef::Config[:file_cache_path], name)
-          plugin = Chef::Resource::RemoteFile.new(path, run_context)
-          plugin.source(new_resource.source)
-          plugin.backup(false)
-          plugin.run_action(:create)
-
-          # Install the plugin from our local cache on disk. There is a bug in
-          # Jenkins that prevents Jenkins from following 302 redirects, so we
-          # use Chef to download the plugin and then use Jenkins to install it.
-          # It's a bit backwards, but so is Jenkins.
-          executor.execute!('install-plugin', escape(plugin.path), '-name', escape(new_resource.name), new_resource.options)
+          install_plugin_from_url(
+            new_resource.source,
+            new_resource.name,
+            nil,
+            cli_opts: new_resource.options
+          )
         else
-          # Install the plugin from the update-center. This results in the
-          # same behaviour as using the UI to install plugins.
-          executor.execute!('install-plugin', escape(new_resource.name), new_resource.options)
+          install_plugin_from_update_center(
+            new_resource.name,
+            new_resource.version,
+            cli_opts: new_resource.options,
+            install_deps: new_resource.install_deps
+          )
         end
       end
 
+      downgrade_block = proc do
+        # remove the existing, newer version
+        uninstall_plugin(new_resource.name)
+
+        # proceed with a normal install
+        install_block.call
+      end
+
       if current_resource.installed?
-        if current_resource.version == new_resource.version ||
-           new_resource.version.to_sym == :latest
-          Chef::Log.debug("#{new_resource} already installed - skipping")
+        if plugin_version(current_resource.version) == desired_version
+          Chef::Log.info("#{new_resource} version #{current_resource.version} already installed - skipping")
         else
-          converge_by("Upgrade #{new_resource} from #{current_resource.version} to #{new_resource.version}", &block)
+          current_version = plugin_version(current_resource.version)
+          unless current_version.to_s.include? 'SNAPSHOT'
+            if plugin_upgrade?(current_version, desired_version)
+              converge_by("Upgrade #{new_resource} from #{current_resource.version} to #{desired_version}", &install_block)
+            else
+              converge_by("Downgrade #{new_resource} from #{current_resource.version} to #{desired_version}", &downgrade_block)
+            end
+          end
         end
       else
-        converge_by("Install #{new_resource}", &block)
+        converge_by("Install #{new_resource}", &install_block)
       end
     end
 
@@ -152,12 +170,12 @@ EOH
     # Plugins that are disabled can be re-enabled from the UI (or by removing
     # *.jpi.disabled file from the disk.)
     #
-    action(:disable) do
+    action :disable do
       unless current_resource.installed?
-        fail PluginNotInstalled.new(new_resource.name, :disable)
+        raise PluginNotInstalled.new(new_resource.name, :disable)
       end
 
-      disabled = "#{plugin_file}.disabled"
+      disabled = "#{plugin_file(new_resource.name)}.disabled"
 
       if ::File.exist?(disabled)
         Chef::Log.debug("#{new_resource} already disabled - skipping")
@@ -176,12 +194,12 @@ EOH
     #
     # Plugins may be disabled by re-adding the +.jpi.disabled+ plugin.
     #
-    action(:enable) do
+    action :enable do
       unless current_resource.installed?
-        fail PluginNotInstalled.new(new_resource.name, :enable)
+        raise PluginNotInstalled.new(new_resource.name, :enable)
       end
 
-      disabled = "#{plugin_file}.disabled"
+      disabled = "#{plugin_file(new_resource.name)}.disabled"
 
       if ::File.exist?(disabled)
         converge_by("Enable #{new_resource}") do
@@ -208,13 +226,10 @@ EOH
     # those configurations that it didn't understand, and pretend as if it
     # didn't see such a fragment.
     #
-    action(:uninstall) do
+    action :uninstall do
       if current_resource.installed?
         converge_by("Uninstall #{new_resource}") do
-          Resource::File.new(plugin_file, run_context).run_action(:delete)
-          directory = Resource::Directory.new(plugin_data_directory, run_context)
-          directory.recursive(true)
-          directory.run_action(:delete)
+          uninstall_plugin(new_resource.name)
         end
       else
         Chef::Log.debug("#{new_resource} not installed - skipping")
@@ -223,34 +238,100 @@ EOH
 
     private
 
+    def desired_version(name = nil, version = nil)
+      name = new_resource.name if name.nil?
+      version = new_resource.version if version.nil?
+
+      if version.to_sym == :latest
+        remote_plugin_data = plugin_universe[name]
+        plugin_version(remote_plugin_data['version'])
+      else
+        plugin_version(version)
+      end
+    end
+
     #
-    # Loads the local plugin into a hash
+    # Installs a plugin along with all of it's dependencies using the
+    # update-center.json data.
     #
-    def current_plugin
-      return @current_plugin if @current_plugin
+    # @param [String] name of the plugin to be installed
+    # @param [String] version of the plugin to be installed
+    # @param [Hash] opts the options install plugin with
+    # @option opts [Boolean] :cli_opts additional flags to pass the jenkins cli command
+    # @option opts [Boolean] :install_deps indicates a plugins dependencies should be installed
+    #
+    def install_plugin_from_update_center(plugin_name, plugin_version, opts = {})
+      remote_plugin_data = plugin_universe[plugin_name]
 
-      manifest = ::File.join(plugins_directory, new_resource.name, 'META-INF', 'MANIFEST.MF')
-      Chef::Log.debug "Load #{new_resource} plugin information from #{manifest}"
+      # Compute some versions; Parse them as `Gem::Version` instances for easy
+      # comparisons.
+      latest_version = plugin_version(remote_plugin_data['version'])
 
-      return nil unless ::File.exist?(manifest)
+      # Brute-force install all dependencies
+      if opts[:install_deps] && remote_plugin_data['dependencies'].any?
+        Chef::Log.debug "Installing plugin dependencies for #{plugin_name}"
 
-      @current_plugin = {}
-
-      ::File.open(manifest, 'r', encoding: 'utf-8') do |file|
-        file.each_line do |line|
-          next if line.strip.empty?
-
-          #
-          # Example Data:
-          #   Plugin-Version: 1.4
-          #
-          config, value = line.split(/:\s/, 2)
-          config = config.gsub('-', '_').downcase.to_sym
-          value = value.strip if value # remove trailing \r\n
-
-          @current_plugin[config] = value
+        remote_plugin_data['dependencies'].each do |dep|
+          # continue if any version of the dependency is installed
+          if plugin_installation_manifest(dep['name'])
+            Chef::Log.debug "A version of dependency #{dep['name']} is already installed - skipping"
+            next
+          elsif dep['optional'] == false
+            # only install required dependencies
+            install_plugin_from_update_center(dep['name'], dep['version'], opts)
+          end
         end
       end
+
+      # Replace the latest version with the desired version in the URL
+      source_url = remote_plugin_data['url']
+      source_url.gsub!(latest_version.to_s, desired_version(plugin_name, plugin_version).to_s)
+
+      install_plugin_from_url(source_url, plugin_name, desired_version(plugin_name, plugin_version), opts)
+    end
+
+    #
+    # Install a plugin from a given hpi (or jpi) source url.
+    #
+    # @param [String] full url of the *.hpi/*.jpi to install
+    # @param [String] name of the plugin to be installed
+    # @param [String] version of the plugin to be installed
+    # @param [Hash] opts the options install plugin with
+    # @option opts [Boolean] :cli_opts additional flags to pass the jenkins cli command
+    # @option opts [Boolean] :install_deps indicates a plugins dependencies should be installed
+    #
+    def install_plugin_from_url(source_url, plugin_name, plugin_version = nil, opts = {})
+      version = plugin_version || Digest::MD5.hexdigest(source_url)
+
+      # Use the remote_file resource to download and cache the plugin (see
+      # comment below for more information).
+      path   = ::File.join(Chef::Config[:file_cache_path], "#{plugin_name}-#{version}.plugin")
+      plugin = Chef::Resource::RemoteFile.new(path, run_context)
+      plugin.source(source_url)
+      plugin.owner(node['jenkins']['master']['user'])
+      plugin.group(node['jenkins']['master']['group'])
+      plugin.backup(false)
+      plugin.run_action(:create)
+
+      # Install the plugin from our local cache on disk. There is a bug in
+      # Jenkins that prevents Jenkins from following 302 redirects, so we
+      # use Chef to download the plugin and then use Jenkins to install it.
+      # It's a bit backwards, but so is Jenkins.
+      executor.execute!('install-plugin', escape('file://' + plugin.path), '-name', escape(plugin_name), opts[:cli_opts])
+    end
+
+    #
+    # Uninstalling a plugin removes the plugin binary (*.jpi) from the disk.
+    #
+    # @param [String] name of the plugin to be uninstall
+    #
+    def uninstall_plugin(plugin_name)
+      file = Resource::File.new(plugin_file(plugin_name), run_context)
+      file.backup(false)
+      file.run_action(:delete)
+      directory = Resource::Directory.new(plugin_data_directory(plugin_name), run_context)
+      directory.recursive(true)
+      directory.run_action(:delete)
     end
 
     #
@@ -265,9 +346,12 @@ EOH
     #
     # The path to the actual plugin file on disk (+.jpi+)
     #
-    def plugin_file
-      hpi = ::File.join(plugins_directory, "#{new_resource.name}.hpi")
-      jpi = ::File.join(plugins_directory, "#{new_resource.name}.jpi")
+    # @param [String] name of the plugin to be installed
+    # @return [String]
+    #
+    def plugin_file(plugin_name)
+      hpi = ::File.join(plugins_directory, "#{plugin_name}.hpi")
+      jpi = ::File.join(plugins_directory, "#{plugin_name}.jpi")
 
       ::File.exist?(hpi) ? hpi : jpi
     end
@@ -275,13 +359,87 @@ EOH
     #
     # The path to where the plugin stores its data on disk.
     #
-    def plugin_data_directory
-      ::File.join(plugins_directory, new_resource.name)
+    def plugin_data_directory(plugin_name)
+      ::File.join(plugins_directory, plugin_name)
+    end
+
+    #
+    # Parsed hash of all known Jenkins plugins
+    #
+    # @return [Hash]
+    #
+    def plugin_universe
+      @plugin_universe ||= begin
+        ensure_update_center_present!
+        JSON.parse(IO.read(extracted_update_center_json).force_encoding('UTF-8'))['plugins']
+      end
+    end
+
+    #
+    # Return the installation manifest for +plugin_name+. If the plugin is not
+    # installed +nil+ is returned.
+    #
+    # @param [String] name of the plugin to be installed
+    # @return [Hash]
+    #
+    def plugin_installation_manifest(plugin_name)
+      manifest = ::File.join(plugins_directory, plugin_name, 'META-INF', 'MANIFEST.MF')
+      Chef::Log.debug "Load #{plugin_name} plugin information from #{manifest}"
+
+      return nil unless ::File.exist?(manifest)
+
+      plugin_manifest = {}
+
+      ::File.open(manifest, 'r', encoding: 'utf-8') do |file|
+        file.each_line do |line|
+          next if line.strip.empty?
+
+          #
+          # Example Data:
+          #   Plugin-Version: 1.4
+          #
+          config, value = line.split(/:\s/, 2)
+          config = config.tr('-', '_').downcase
+          value = value.strip if value # remove trailing \r\n
+
+          plugin_manifest[config] = value
+        end
+      end
+
+      plugin_manifest
+    end
+
+    #
+    # Return whether plugin should be upgraded to desired version
+    # (i.e. that current < desired).
+    # https://github.com/chef-cookbooks/jenkins/issues/380
+    # If only one of the two versions is a Gem::Version, we
+    # fallback to String comparison.
+    #
+    # @param [Gem::Version, String] current_version
+    # @param [Gem::Version, String] desired_version
+    # @return [Boolean]
+    #
+    def plugin_upgrade?(current_version, desired_version)
+      current_version < desired_version
+    rescue ArgumentError
+      current_version.to_s < desired_version.to_s
+    end
+
+    #
+    # Return the plugin version for +version+.
+    # https://github.com/chef-cookbooks/jenkins/issues/292
+    # Prefer to use Gem::Version as that will be more accurate than
+    # comparing strings, but sadly Jenkins plugins may not always
+    # follow "normal" version patterns
+    #
+    # @param [String] version
+    # @return [String]
+    #
+    def plugin_version(version)
+      Gem::Version.new(version)
+    rescue ArgumentError
+      version
     end
   end
 end
-
-Chef::Platform.set(
-  resource: :jenkins_plugin,
-  provider: Chef::Provider::JenkinsPlugin
-)

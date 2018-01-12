@@ -1,10 +1,10 @@
 #
-# Cookbook Name:: jenkins
+# Cookbook:: jenkins
 # HWRP:: slave
 #
-# Author:: Seth Chisamore <schisamo@getchef.com>
+# Author:: Seth Chisamore <schisamo@chef.io>
 #
-# Copyright 2013-2014, Chef Software, Inc.
+# Copyright:: 2013-2017, Chef Software, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,19 +19,16 @@
 # limitations under the License.
 #
 
-require_relative '_helper'
-require_relative '_params_validate'
-
 require 'json'
+
+require_relative '_helper'
 
 class Chef
   class Resource::JenkinsSlave < Resource::LWRPBase
+    resource_name :jenkins_slave
+
     # Chef attributes
     identity_attr :slave_name
-    provides :jenkins_slave
-
-    # Set the resource name
-    self.resource_name = :jenkins_slave
 
     # Actions
     actions :create, :delete, :connect, :disconnect, :online, :offline
@@ -39,48 +36,48 @@ class Chef
 
     # Attributes
     attribute :slave_name,
-      kind_of: String,
-      name_attribute: true
+              kind_of: String,
+              name_attribute: true
     attribute :description,
-      kind_of: String,
-      default: lazy { |new_resource|
-        "Jenkins slave #{new_resource.slave_name}"
-      }
+              kind_of: String,
+              default: lazy { |new_resource| "Jenkins slave #{new_resource.slave_name}" }
     attribute :remote_fs,
-      kind_of: String,
-      default: '/home/jenkins'
+              kind_of: String,
+              default: '/home/jenkins'
     attribute :executors,
-      kind_of: Integer,
-      default: 1
+              kind_of: Integer,
+              default: 1
     attribute :usage_mode,
-      kind_of: String,
-      equal_to: %w(exclusive normal),
-      default: 'normal'
+              kind_of: String,
+              equal_to: %w(exclusive normal),
+              default: 'normal'
     attribute :labels,
-      kind_of: Array,
-      default: []
+              kind_of: Array,
+              default: []
     attribute :availability,
-      kind_of: String,
-      equal_to: %w(always demand)
+              kind_of: String,
+              equal_to: %w(always demand)
     attribute :in_demand_delay,
-      kind_of: Integer,
-      default: 0
+              kind_of: Integer,
+              default: 0
     attribute :idle_delay,
-      kind_of: Integer,
-      default: 1
+              kind_of: Integer,
+              default: 1
     attribute :environment,
-      kind_of: Hash
+              kind_of: Hash
     attribute :offline_reason,
-      kind_of: String
+              kind_of: String
     attribute :user,
-      kind_of: String,
-      regex: Config[:user_valid_regex],
-      default: 'jenkins'
+              kind_of: String,
+              regex: Config[:user_valid_regex],
+              default: 'jenkins'
     attribute :jvm_options,
-      kind_of: String
+              kind_of: String
     attribute :nofile_limit,
-      kind_of: Integer,
-      default: 4096
+              kind_of: Integer,
+              default: 4096
+    attribute :java_path,
+              kind_of: String
 
     attr_writer :exists
     attr_writer :connected
@@ -93,7 +90,7 @@ class Chef
     # @return [Boolean]
     #
     def exists?
-      !!@exists
+      !@exists.nil? && @exists
     end
 
     #
@@ -103,7 +100,7 @@ class Chef
     # @return [Boolean]
     #
     def connected?
-      !!@connected
+      !@connected.nil? && @connected
     end
 
     #
@@ -113,18 +110,19 @@ class Chef
     # @return [Boolean]
     #
     def online?
-      !!@online
+      !@online.nil? && @online
     end
   end
 end
 
 class Chef
   class Provider::JenkinsSlave < Provider::LWRPBase
+    provides :jenkins_slave
+    use_inline_resources
+
     include Jenkins::Helper
 
-    def whyrun_supported?
-      true
-    end
+    provides :jenkins_slave
 
     def load_current_resource
       @current_resource ||= Resource::JenkinsSlave.new(new_resource.name)
@@ -144,9 +142,20 @@ class Chef
       @current_resource
     end
 
-    def action_create
+    #
+    # This provider supports why-run mode.
+    #
+    def whyrun_supported?
+      true
+    end
+
+    action :create do
+      do_create
+    end
+
+    def do_create
       if current_resource.exists? && correct_config?
-        Chef::Log.debug("#{new_resource} exists - skipping")
+        Chef::Log.info("#{new_resource} exists - skipping")
       else
         converge_by("Create #{new_resource}") do
           executor.groovy! <<-EOH.gsub(/ ^{12}/, '')
@@ -159,7 +168,7 @@ class Chef
             availability = #{convert_to_groovy(new_resource.availability)}
             usage_mode = #{convert_to_groovy(new_resource.usage_mode)}
             env_map = #{convert_to_groovy(new_resource.environment)}
-            labels = #{convert_to_groovy(new_resource.labels.sort.join("\s"))}
+            labels = #{convert_to_groovy(new_resource.labels.sort.join(' '))}
 
             // Compute the usage mode
             if (usage_mode == 'normal') {
@@ -216,7 +225,11 @@ class Chef
       end
     end
 
-    def action_delete
+    action :delete do
+      do_delete
+    end
+
+    def do_delete
       if current_resource.exists?
         converge_by("Delete #{new_resource}") do
           executor.execute!('delete-node', escape(new_resource.slave_name))
@@ -226,7 +239,7 @@ class Chef
       end
     end
 
-    def action_connect
+    action :connect do
       if current_resource.exists? && current_resource.connected?
         Chef::Log.debug("#{new_resource} already connected - skipping")
       else
@@ -236,7 +249,7 @@ class Chef
       end
     end
 
-    def action_disconnect
+    action :disconnect do
       if current_resource.connected?
         converge_by("Disconnect #{new_resource}") do
           executor.execute!('disconnect-node', escape(new_resource.slave_name))
@@ -246,7 +259,7 @@ class Chef
       end
     end
 
-    def action_online
+    action :online do
       if current_resource.exists? && current_resource.online?
         Chef::Log.debug("#{new_resource} already online - skipping")
       else
@@ -256,10 +269,10 @@ class Chef
       end
     end
 
-    def action_offline
+    action :offline do
       if current_resource.online?
         converge_by("Offline #{new_resource}") do
-          command_pieces  = [escape(new_resource.slave_name)]
+          command_pieces = [escape(new_resource.slave_name)]
           if new_resource.offline_reason
             command_pieces << "-m '#{escape(new_resource.offline_reason)}'"
           end
@@ -270,18 +283,17 @@ class Chef
       end
     end
 
-    protected
+    private
 
     #
     # Returns a Groovy snippet that creates an instance of the slave's
     # launcher implementation. The launcher instance should be set to
     # a Groovy variable named `launcher`.
     #
-    # @abstract
     # @return [String]
     #
     def launcher_groovy
-      fail NotImplementedError, 'You must implement #launcher_groovy.'
+      'launcher = new hudson.slaves.JNLPLauncher()'
     end
 
     #
@@ -300,8 +312,6 @@ class Chef
     def attribute_to_property_map
       {}
     end
-
-    private
 
     #
     # Loads the current slave into a Hash.
@@ -328,6 +338,11 @@ class Chef
           return null
         }
 
+        def slave_environment = null
+        slave_env_vars = slave.nodeProperties.get(EnvironmentVariablesNodeProperty.class)?.envVars
+        if (slave_env_vars)
+          slave_environment = new java.util.HashMap<String,String>(slave_env_vars)
+
         current_slave = [
           name:slave.name,
           description:slave.nodeDescription,
@@ -335,7 +350,7 @@ class Chef
           executors:slave.numExecutors.toInteger(),
           usage_mode:slave.mode.toString().toLowerCase(),
           labels:slave.labelString.split().sort(),
-          environment:slave.nodeProperties.get(EnvironmentVariablesNodeProperty.class)?.envVars,
+          environment:slave_environment,
           connected:(slave.computer.connectTime > 0),
           online:slave.computer.online
         ]
@@ -402,8 +417,3 @@ class Chef
     end
   end
 end
-
-Chef::Platform.set(
-  resource: :jenkins_slave,
-  provider: Chef::Provider::JenkinsSlave
-)
